@@ -1,0 +1,30 @@
+# Build output
+build/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+
+# Local toolchain (optional vendoring of w64devkit)
+.tools/
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Capture output stays in shots/ on purpose (evidence for the design),
+# but a scratch run writes here.
+.tmp/
+
+# Runtime data (a run with WADA_DATA_DIR=. writes these)
+wada.db
+wada.db-wal
+wada.db-shm
+wada.lock
+backups/
+*.db
+*.db-wal
+*.db-shm
