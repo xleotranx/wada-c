@@ -148,6 +148,30 @@ static int test_events(void) {
     wada_bus_publish(bus, "turn", &payload, sizeof payload);
     CHECK(g_ncalls == 3);
 
+    /* Wildcards ("wb/*" and "*") preserve priority + registration order. */
+    g_ncalls = 0;
+    wada_scope *sc = wada_scope_create(NULL, "wb");
+    wada_sub *exact = wada_bus_subscribe_scoped(bus, sc, "wb/issue.created", 1, record, (void *)(intptr_t)1);
+    wada_sub *pref = wada_bus_subscribe_scoped(bus, sc, "wb/*", 5, record, (void *)(intptr_t)2);
+    wada_sub *all = wada_bus_subscribe_scoped(bus, sc, "*", 0, record, (void *)(intptr_t)3);
+    CHECK(exact != NULL && pref != NULL && all != NULL);
+
+    int val = 1;
+    wada_bus_publish(bus, "wb/issue.created", &val, sizeof val);
+    CHECK(g_ncalls == 3);
+    CHECK(g_calls[0] == 21 && g_calls[1] == 11 && g_calls[2] == 31);
+
+    /* Non-matching prefix skips "wb/*" and exact, hits only "*". */
+    g_ncalls = 0;
+    wada_bus_publish(bus, "other/event", &val, sizeof val);
+    CHECK(g_ncalls == 1 && g_calls[0] == 31);
+
+    /* Destroying scope cancels all scoped subscriptions. */
+    wada_scope_destroy(sc);
+    g_ncalls = 0;
+    wada_bus_publish(bus, "wb/issue.created", &val, sizeof val);
+    CHECK(g_ncalls == 0);
+
     wada_bus_destroy(bus);
     return 0;
 }

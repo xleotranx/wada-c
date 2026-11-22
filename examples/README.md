@@ -5,11 +5,17 @@ to read in one sitting:
 
 | Example | Files | Shows |
 |---|---|---|
+| [`notes/`](notes) | 4 | full product: split meta/body records, FTS5 search, autosave, two-click delete, `.wnotes` export/import, i18n |
+| [`learning/`](learning) | 4 | full product: `wada_records` + `wada_ui`, SM-2 scheduler, due queue, review session, i18n |
 | [`hello/`](hello) | 2 | product lifecycle, commands, shortcuts, the event bus, scopes |
-| [`todo/`](todo) | 2 | persistence through the `store` service, a versioned record format, toggle/clear |
+| [`todo/`](todo) | 2 | persistence through `wada_records` and `wada_ui`, a versioned record format, toggle/clear |
+| [`bookmarks/`](bookmarks) | 2 | `wada_records` + `wada_ui` + `wada_bus` (`bm/changed`), two-click delete, declared `walk` |
+| [`workbench/`](workbench) | 5 | complex multi-product app (`wb.issues` + `wb.activity`): 3 prefixes, `wada_records_search`, `wada_boot_desc.setup`, app-lifetime service, wildcard `"wb/*"` + `"product/entered"` |
 
-The shipped app's products in [`../src/apps/`](../src/apps) are the fuller
-references (notes, learning); these examples are the teaching versions.
+`notes/` and `learning/` are also compiled together into the shipped multi-product
+app (`src/main.c` → `wada.exe`); `hello/`, `todo/` and `bookmarks/` are the
+compact teaching versions, and `workbench/` demonstrates a full multi-product
+architecture over shared core services.
 
 ## Build and run
 
@@ -17,13 +23,18 @@ From the repository root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
+.\build\wada_notes.exe
+.\build\wada_learning.exe
 .\build\wada_hello.exe
 .\build\wada_todo.exe
+.\build\wada_bookmarks.exe
+.\build\wada_workbench.exe
 ```
 
-Each example passes a `data_subdir` to boot (`Wada Hello`, `Wada Todo`), so it
-reads and writes its own database under the app data root and cannot touch the
-shipped app's notes. Only one Wada process can hold a data directory at a time
+Each example passes a `data_subdir` to boot (`Wada Notes`, `Wada Learning`,
+`Wada Hello`, `Wada Todo`, `Wada Bookmarks`, `Wada Workbench`), so it reads and
+writes its own database under the app data root and cannot touch the shipped
+app's notes. Only one Wada process can hold a data directory at a time
 (`wada.lock`), so run the examples one at a time or point `WADA_DATA_DIR` at
 scratch folders.
 
@@ -80,8 +91,8 @@ state or a confirmation are counted too. List only commands that are safe there
 
 ## Adding a product to the shipped app
 
-1. Create `src/apps/<name>/` with the repo logic and `<name>_product.c`.
-2. Add both `.c` files to the `wada` executable in `CMakeLists.txt`.
+1. Create `examples/<name>/` with the repo logic and `<name>_product.c`.
+2. Add the product `.c` files to the `wada` executable in `CMakeLists.txt` (and optionally a standalone `wada_<name>` target with `main.c`).
 3. Declare the product in `src/main.c` and add it to the array.
 4. Nothing else: the product host, palette, settings and store service are
    already there.

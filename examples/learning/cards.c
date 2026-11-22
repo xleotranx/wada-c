@@ -15,29 +15,6 @@
  *     <back, one line>
  */
 
-static void sanitize(const char *in, char *out, size_t cap) {
-    size_t i = 0;
-    if (!in) in = "";
-    for (; in[i] && i + 1 < cap; i++) {
-        char ch = in[i];
-        if (ch == '\n' || ch == '\r') ch = ' ';
-        out[i] = ch;
-    }
-    out[i] = '\0';
-}
-
-static bool next_line(const char **p, const char *end, char *out, size_t cap) {
-    if (*p >= end) return false;
-    const char *nl = (const char *)memchr(*p, '\n', (size_t)(end - *p));
-    const char *stop = nl ? nl : end;
-    size_t n = (size_t)(stop - *p);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, *p, n);
-    out[n] = '\0';
-    *p = nl ? nl + 1 : end;
-    return true;
-}
-
 static void parse_card(const char *id, const void *data, size_t len, card *out) {
     memset(out, 0, sizeof *out);
     snprintf(out->id, sizeof out->id, "%s", id);
@@ -47,47 +24,22 @@ static void parse_card(const char *id, const void *data, size_t len, card *out) 
     const char *end = p + len;
     char line[64];
 
-    if (!next_line(&p, end, line, sizeof line) || strcmp(line, "v1") != 0) return;
-    if (!next_line(&p, end, line, sizeof line)) return;
+    if (!wada_records_next_line(&p, end, line, sizeof line) || strcmp(line, "v1") != 0) return;
+    if (!wada_records_next_line(&p, end, line, sizeof line)) return;
     out->ease = atof(line);
     if (out->ease < 1.3 || out->ease > 3.0) out->ease = 2.5;
-    if (!next_line(&p, end, line, sizeof line)) return;
+    if (!wada_records_next_line(&p, end, line, sizeof line)) return;
     out->reps = atoi(line);
-    if (!next_line(&p, end, line, sizeof line)) return;
+    if (!wada_records_next_line(&p, end, line, sizeof line)) return;
     out->interval_min = atoi(line);
-    if (!next_line(&p, end, line, sizeof line)) return;
+    if (!wada_records_next_line(&p, end, line, sizeof line)) return;
     out->due = atoll(line);
 
-    if (!next_line(&p, end, out->front, sizeof out->front)) return;
+    if (!wada_records_next_line(&p, end, out->front, sizeof out->front)) return;
     size_t back_len = (size_t)(end - p);
     if (back_len >= sizeof out->back) back_len = sizeof out->back - 1;
     memcpy(out->back, p, back_len);
     out->back[back_len] = '\0';
-}
-
-static void card_key(const char *id, char *out, size_t cap) {
-    snprintf(out, cap, "card/%s", id);
-}
-
-/* The id is the suffix; the key always gets the prefix from card_key(). A
- * reloaded card must stay writable with the same key it was read from. */
-static bool id_taken(cards *c, const char *id) {
-    char key[96];
-    card_key(id, key, sizeof key);
-    wada_txn *txn = NULL;
-    if (c->ops->begin(c->store, WADA_STORE_READ, &txn, NULL) != WADA_OK) return false;
-    wada_slice k = {(const uint8_t *)key, strlen(key)};
-    wada_slice value;
-    bool taken = c->ops->get(txn, k, &value, NULL) == WADA_OK;
-    c->ops->rollback(txn);
-    return taken;
-}
-
-static void fresh_id(cards *c, char *out, size_t cap) {
-    for (int attempt = 0; attempt < 8; attempt++) {
-        wada_id_make(out, cap);
-        if (!id_taken(c, out)) return;
-    }
 }
 
 static bool append_item(cards *c, const card *item) {
@@ -102,39 +54,20 @@ static bool append_item(cards *c, const card *item) {
     return true;
 }
 
-static wada_status load_all(cards *c, wada_err *err) {
-    wada_txn *txn = NULL;
-    wada_status st = c->ops->begin(c->store, WADA_STORE_READ, &txn, err);
-    if (st != WADA_OK) return st;
+typedef struct cards_load_ctx {
+    cards *c;
+    bool oom;
+} cards_load_ctx;
 
-    wada_iter *it = NULL;
-    wada_slice prefix = {(const uint8_t *)"card/", 5};
-    st = c->ops->list(txn, prefix, &it, err);
-    if (st != WADA_OK) {
-        c->ops->rollback(txn);
-        return st;
+static bool load_visitor(const char *id, wada_slice value, void *user) {
+    cards_load_ctx *ctx = (cards_load_ctx *)user;
+    card item;
+    parse_card(id, value.p, value.n, &item);
+    if (!append_item(ctx->c, &item)) {
+        ctx->oom = true;
+        return false;
     }
-
-    wada_slice key, value;
-    while (c->ops->next(it, &key, &value, NULL) == WADA_OK) {
-        /* Keys are "card/<id>"; the record keeps the id, not the key. */
-        if (key.n <= 5) continue;
-        char id[CARD_ID_CAP];
-        size_t id_len = key.n - 5;
-        if (id_len > sizeof id - 1) id_len = sizeof id - 1;
-        memcpy(id, key.p + 5, id_len);
-        id[id_len] = '\0';
-
-        card item;
-        parse_card(id, value.p, value.n, &item);
-        if (!append_item(c, &item)) {
-            c->ops->iter_close(it);
-            c->ops->rollback(txn);
-            return wada_err_set(err, WADA_ERR_NOMEM, "cards load");
-        }
-    }
-    c->ops->iter_close(it);
-    return c->ops->commit(txn, err);
+    return true;
 }
 
 static wada_status write_card(cards *c, const card *item, wada_err *err) {
@@ -151,24 +84,7 @@ static wada_status write_card(cards *c, const card *item, wada_err *err) {
         return wada_err_set(err, WADA_ERR, "encode card");
     }
     memcpy(buf + head, item->back, back_len);
-    size_t len = (size_t)head + back_len;
-
-    wada_txn *txn = NULL;
-    wada_status st = c->ops->begin(c->store, WADA_STORE_WRITE, &txn, err);
-    if (st != WADA_OK) {
-        free(buf);
-        return st;
-    }
-    char keybuf[96];
-    card_key(item->id, keybuf, sizeof keybuf);
-    wada_slice key = {(const uint8_t *)keybuf, strlen(keybuf)};
-    wada_slice value = {(const uint8_t *)buf, len};
-    st = c->ops->put(txn, key, value, err);
-    if (st == WADA_OK) {
-        st = c->ops->commit(txn, err);
-    } else {
-        c->ops->rollback(txn);
-    }
+    wada_status st = wada_records_put(&c->rec, item->id, buf, (size_t)head + back_len, err);
     free(buf);
     return st;
 }
@@ -176,27 +92,19 @@ static wada_status write_card(cards *c, const card *item, wada_err *err) {
 wada_status cards_open(cards *c, const wada_store_ops *ops, const char *url, wada_err *err) {
     if (!c || !ops || !url) return wada_err_set(err, WADA_ERR_INVALID, "cards_open");
     memset(c, 0, sizeof *c);
-    if (!wada_ops_ok(&ops->hdr, sizeof(wada_store_ops), WADA_STORE_ABI)) {
-        return wada_err_set(err, WADA_ERR_ABI, "store provider ABI %u, expected %u", ops->hdr.version, WADA_STORE_ABI);
-    }
-    c->ops = ops;
-    wada_status st = ops->open(url, &c->store, err);
-    if (st != WADA_OK) {
-        c->ops = NULL;
-        return st;
-    }
-    st = load_all(c, err);
-    if (st != WADA_OK) {
-        ops->close(c->store);
-        free(c->items);
-        memset(c, 0, sizeof *c);
-    }
+    wada_status st = wada_records_open(&c->rec, ops, url, "card/", err);
+    if (st != WADA_OK) return st;
+
+    cards_load_ctx ctx = {c, false};
+    st = wada_records_each(&c->rec, load_visitor, &ctx, err);
+    if (ctx.oom) st = wada_err_set(err, WADA_ERR_NOMEM, "cards load");
+    if (st != WADA_OK) cards_close(c);
     return st;
 }
 
 void cards_close(cards *c) {
     if (!c) return;
-    if (c->ops && c->store) c->ops->close(c->store);
+    wada_records_close(&c->rec);
     free(c->items);
     memset(c, 0, sizeof *c);
 }
@@ -223,9 +131,9 @@ int cards_create(cards *c, const char *front, const char *back, wada_err *err) {
     card item;
     memset(&item, 0, sizeof item);
     long long now = (long long)time(NULL);
-    fresh_id(c, item.id, sizeof item.id);
-    sanitize(front, item.front, sizeof item.front);
-    sanitize(back, item.back, sizeof item.back);
+    wada_records_fresh_id(&c->rec, item.id, sizeof item.id);
+    wada_records_sanitize_line(front, item.front, sizeof item.front);
+    wada_records_sanitize_line(back, item.back, sizeof item.back);
     item.ease = 2.5;
     item.reps = 0;
     item.interval_min = 0;

@@ -75,6 +75,7 @@ static bool enter_index(wada_host *h, int index) {
     wada_app_set_title(h->app, wada_tr(next->title));
     if (h->settings) wada_settings_set(h->settings, "app/product", next->id, NULL);
     wada_app_set_status(h->app, wada_tr(next->title));
+    wada_app_emit(h->app, "product/entered", next->id, strlen(next->id) + 1);
     return true;
 }
 

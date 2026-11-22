@@ -9,6 +9,7 @@ add_library(wada_core STATIC
     src/core/wada_err.c
     src/core/wada_id.c
     src/core/wada_log.c
+    src/core/wada_records.c
     src/core/wada_scope.c
     src/core/wada_event.c
     src/core/wada_registry.c
@@ -48,6 +49,7 @@ add_library(wada_shell STATIC
     src/shell/wada_module.c
     src/shell/wada_settings.c
     src/shell/wada_settings_ui.c
+    src/shell/wada_ui.c
     vendor/cui/cui.c
 )
 target_include_directories(wada_shell PUBLIC src/core src/shell vendor/cui)
@@ -91,18 +93,40 @@ set_target_properties(wada_bad_plugin PROPERTIES PREFIX "")
 # The shipped app: a product table and one boot call.
 add_executable(wada
     src/main.c
-    src/apps/notes/notes.c
-    src/apps/notes/notes_product.c
-    src/apps/learning/cards.c
-    src/apps/learning/learning_product.c
+    examples/notes/notes.c
+    examples/notes/notes_product.c
+    examples/learning/cards.c
+    examples/learning/learning_product.c
 )
-target_include_directories(wada PRIVATE src/apps/notes src/apps/learning)
+target_include_directories(wada PRIVATE examples/notes examples/learning)
 target_link_libraries(wada PRIVATE wada_shell)
 if(WIN32)
     set_target_properties(wada PROPERTIES WIN32_EXECUTABLE ON)
 endif()
 
 # Examples: each is a product plus a main that boots it.
+add_executable(wada_notes
+    examples/notes/main.c
+    examples/notes/notes.c
+    examples/notes/notes_product.c
+)
+target_include_directories(wada_notes PRIVATE examples/notes)
+target_link_libraries(wada_notes PRIVATE wada_shell)
+if(WIN32)
+    set_target_properties(wada_notes PROPERTIES WIN32_EXECUTABLE ON)
+endif()
+
+add_executable(wada_learning
+    examples/learning/main.c
+    examples/learning/cards.c
+    examples/learning/learning_product.c
+)
+target_include_directories(wada_learning PRIVATE examples/learning)
+target_link_libraries(wada_learning PRIVATE wada_shell)
+if(WIN32)
+    set_target_properties(wada_learning PROPERTIES WIN32_EXECUTABLE ON)
+endif()
+
 add_executable(wada_hello
     examples/hello/main.c
     examples/hello/hello_product.c
@@ -121,21 +145,46 @@ if(WIN32)
     set_target_properties(wada_todo PROPERTIES WIN32_EXECUTABLE ON)
 endif()
 
+add_executable(wada_bookmarks
+    examples/bookmarks/main.c
+    examples/bookmarks/bookmarks_product.c
+)
+target_link_libraries(wada_bookmarks PRIVATE wada_shell)
+if(WIN32)
+    set_target_properties(wada_bookmarks PROPERTIES WIN32_EXECUTABLE ON)
+endif()
+
+add_executable(wada_workbench
+    examples/workbench/main.c
+    examples/workbench/wb_store.c
+    examples/workbench/wb_issues_product.c
+    examples/workbench/wb_activity_product.c
+)
+target_include_directories(wada_workbench PRIVATE examples/workbench)
+target_link_libraries(wada_workbench PRIVATE wada_shell)
+if(WIN32)
+    set_target_properties(wada_workbench PROPERTIES WIN32_EXECUTABLE ON)
+endif()
+
 # Tests.
 add_executable(wada_tests tests/test_core.c)
 target_include_directories(wada_tests PRIVATE src/core)
 target_link_libraries(wada_tests PRIVATE wada_core)
 
+add_executable(wada_records_tests tests/test_records.c)
+target_include_directories(wada_records_tests PRIVATE src/core src/providers/sqlite)
+target_link_libraries(wada_records_tests PRIVATE wada_sqlite)
+
 add_executable(wada_store_tests tests/test_store.c)
 target_include_directories(wada_store_tests PRIVATE src/core src/providers/sqlite vendor/sqlite)
 target_link_libraries(wada_store_tests PRIVATE wada_sqlite)
 
-add_executable(wada_notes_tests tests/test_notes.c src/apps/notes/notes.c)
-target_include_directories(wada_notes_tests PRIVATE src/core src/apps/notes)
+add_executable(wada_notes_tests tests/test_notes.c examples/notes/notes.c)
+target_include_directories(wada_notes_tests PRIVATE src/core examples/notes)
 target_link_libraries(wada_notes_tests PRIVATE wada_sqlite)
 
-add_executable(wada_cards_tests tests/test_cards.c src/apps/learning/cards.c)
-target_include_directories(wada_cards_tests PRIVATE src/core src/apps/learning)
+add_executable(wada_cards_tests tests/test_cards.c examples/learning/cards.c)
+target_include_directories(wada_cards_tests PRIVATE src/core examples/learning)
 target_link_libraries(wada_cards_tests PRIVATE wada_sqlite)
 
 add_executable(wada_host_tests tests/test_host.c)
@@ -151,8 +200,13 @@ add_dependencies(wada_plugin_tests wada_store_plugin wada_bad_plugin)
 add_executable(wada_instance_tests tests/test_instance.c)
 target_link_libraries(wada_instance_tests PRIVATE wada_shell)
 
+add_executable(wada_workbench_tests tests/test_workbench.c examples/workbench/wb_store.c)
+target_include_directories(wada_workbench_tests PRIVATE examples/workbench)
+target_link_libraries(wada_workbench_tests PRIVATE wada_shell)
+
 enable_testing()
 add_test(NAME core COMMAND wada_tests)
+add_test(NAME records COMMAND wada_records_tests)
 add_test(NAME store COMMAND wada_store_tests)
 add_test(NAME notes COMMAND wada_notes_tests)
 add_test(NAME cards COMMAND wada_cards_tests)
@@ -160,3 +214,4 @@ add_test(NAME host COMMAND wada_host_tests)
 add_test(NAME i18n COMMAND wada_i18n_tests)
 add_test(NAME plugin COMMAND wada_plugin_tests $<TARGET_FILE:wada_store_plugin> $<TARGET_FILE:wada_bad_plugin>)
 add_test(NAME instance COMMAND wada_instance_tests)
+add_test(NAME workbench COMMAND wada_workbench_tests)

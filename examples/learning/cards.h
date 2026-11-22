@@ -1,12 +1,13 @@
 /* Cards: the learning product's store layer.
  *
  * Same shape as notes: a text record per card under "card/", reviewed with a
- * small SM-2 style scheduler. It knows only wada_store_ops.
+ * small SM-2 style scheduler. It knows only wada_store_ops via wada_records.
  */
 #ifndef CARDS_H
 #define CARDS_H
 
 #include "wada_iface.h"
+#include "wada_records.h"
 
 #define CARD_ID_CAP 48
 #define CARD_TEXT_CAP 512
@@ -22,8 +23,7 @@ typedef struct card {
 } card;
 
 typedef struct cards {
-    const wada_store_ops *ops;
-    wada_store *store;
+    wada_records rec;
     card *items;
     int count;
     int cap;

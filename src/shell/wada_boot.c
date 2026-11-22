@@ -108,8 +108,8 @@ static void print_provider(FILE *out, const wada_module *module) {
     }
 }
 
-static int doctor(FILE *out, const char *db_path, const char *log_path, const wada_module *module,
-                  const wada_store_ops *ops, wada_settings *settings) {
+static int doctor(FILE *out, const wada_boot_desc *desc, const char *db_path, const char *log_path,
+                  const wada_module *module, const wada_store_ops *ops, wada_settings *settings) {
     fprintf(out, "wada %s (core ABI %u)\n", WADA_VERSION_STRING, WADA_ABI);
     fprintf(out, "database: %s\n", db_path);
     fprintf(out, "log: %s\n", log_path);
@@ -172,10 +172,28 @@ static int doctor(FILE *out, const char *db_path, const char *log_path, const wa
 
     fprintf(out, "counts:");
     {
-        static const char *prefixes[] = {"note/", "note-body/", "card/", "settings/", "todo/"};
-        for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
-            int n = count_prefix(ops, db, prefixes[i]);
-            fprintf(out, " %s=%d", prefixes[i], n);
+        const char *seen[64];
+        int nseen = 0;
+        seen[nseen++] = "settings/";
+        for (int i = 0; desc && i < desc->product_count; i++) {
+            const wada_product *p = desc->products[i];
+            if (!p || !p->prefixes) continue;
+            for (int j = 0; j < p->prefix_count && nseen < 64; j++) {
+                const char *pfx = p->prefixes[j];
+                if (!pfx || !pfx[0]) continue;
+                bool dup = false;
+                for (int k = 0; k < nseen; k++) {
+                    if (strcmp(seen[k], pfx) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) seen[nseen++] = pfx;
+            }
+        }
+        for (int i = 0; i < nseen; i++) {
+            int n = count_prefix(ops, db, seen[i]);
+            fprintf(out, " %s=%d", seen[i], n);
         }
         fprintf(out, "\n");
     }
@@ -275,6 +293,11 @@ static int doctor_commands(FILE *out, const wada_boot_desc *desc, const wada_sto
     if (wada_registry_add(wada_app_registry(app), wada_app_scope(app), "store", WADA_STORE_ABI,
                           store) != WADA_OK) {
         fprintf(out, "commands: FAIL (store service)\n");
+        wada_app_destroy(app);
+        return 1;
+    }
+    if (desc->setup && desc->setup(app, wada_app_scope(app), dir, &err) != WADA_OK) {
+        fprintf(out, "setup: FAIL (%s)\n", wada_err_msg(&err));
         wada_app_destroy(app);
         return 1;
     }
@@ -440,7 +463,7 @@ int wada_boot_run(const wada_boot_desc *desc, int argc, char **argv) {
         char report[700];
         snprintf(report, sizeof report, "%s" WADA_PATH_SEP "doctor.txt", data_dir);
         FILE *f = fopen(report, "w");
-        int rc = f ? doctor(f, db_path, log_path, module, store, settings) : 1;
+        int rc = f ? doctor(f, desc, db_path, log_path, module, store, settings) : 1;
         if (rc == 0 && f) rc = doctor_commands(f, desc, store, settings, data_dir);
         if (f) fclose(f);
         fprintf(stdout, "doctor report: %s\n", report);
@@ -480,6 +503,15 @@ int wada_boot_run(const wada_boot_desc *desc, int argc, char **argv) {
     if (wada_registry_add(wada_app_registry(app), wada_app_scope(app), "store", WADA_STORE_ABI,
                           store) != WADA_OK) {
         fprintf(stderr, "wada: could not publish the store service\n");
+        wada_app_destroy(app);
+        wada_instance_release(instance);
+        wada_settings_close(settings);
+        wada_module_unload(module);
+        return 1;
+    }
+    if (desc->setup && desc->setup(app, wada_app_scope(app), data_dir, &err) != WADA_OK) {
+        WADA_LOGE("app", "setup: %s", wada_err_msg(&err));
+        fprintf(stderr, "wada: %s\n", wada_err_msg(&err));
         wada_app_destroy(app);
         wada_instance_release(instance);
         wada_settings_close(settings);

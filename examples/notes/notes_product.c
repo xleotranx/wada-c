@@ -10,12 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "notes.h"
 #include "wada_app.h"
 #include "wada_log.h"
 #include "wada_product.h"
+#include "wada_ui.h"
 
 #define MAX_FILTERED 1024
 #define AUTOSAVE_FRAMES 20
@@ -41,8 +41,7 @@ typedef struct notes_state {
     int filtered_count;
     bool dirty;
     int idle;
-    int confirm_delete; /* index awaiting a second click, or -1 */
-    int confirm_frames;
+    wada_ui_confirm confirm;
     char status[128];
 } notes_state;
 
@@ -111,8 +110,7 @@ static void select_note(notes_state *st, int index) {
     const note *n = notes_at(&st->repo, index);
     if (!n) return;
     st->selected = index;
-    st->confirm_delete = -1;
-    st->confirm_frames = 0;
+    wada_ui_confirm_reset(&st->confirm);
 
     size_t len = 0;
     wada_err err;
@@ -136,16 +134,6 @@ static void select_note(notes_state *st, int index) {
     snprintf(st->base_body, st->base_cap, "%s", st->body);
     st->dirty = false;
     st->idle = 0;
-}
-
-static void format_when(long long updated, char *out, size_t cap) {
-    time_t t = (time_t)updated;
-    struct tm *tm = localtime(&t);
-    if (!tm) {
-        snprintf(out, cap, "");
-        return;
-    }
-    strftime(out, cap, "%Y-%m-%d %H:%M", tm);
 }
 
 static void save_now(notes_state *st, bool announce) {
@@ -215,7 +203,7 @@ static void delete_selected(notes_state *st) {
     }
     st->data_version++;
     st->selected = -1;
-    st->confirm_delete = -1;
+    wada_ui_confirm_reset(&st->confirm);
     int count = notes_count(&st->repo);
     if (count > 0) select_note(st, old < count ? old : count - 1);
     wada_app_set_status(st->app, wada_tr("note deleted"));
@@ -224,9 +212,7 @@ static void delete_selected(notes_state *st) {
 static void cmd_delete(void *user) {
     notes_state *st = (notes_state *)user;
     if (st->selected < 0) return;
-    if (st->confirm_delete != st->selected) {
-        st->confirm_delete = st->selected;
-        st->confirm_frames = CONFIRM_FRAMES;
+    if (!wada_ui_confirm_step(&st->confirm, st->selected, CONFIRM_FRAMES)) {
         wada_app_set_status(st->app, wada_tr("click Delete again to confirm"));
         return;
     }
@@ -306,7 +292,7 @@ static void sidebar(notes_state *st) {
                 const note *n = notes_at(&st->repo, index);
                 if (!n) continue;
                 char when[32];
-                format_when(n->updated, when, sizeof when);
+                wada_ui_format_when(n->updated, when, sizeof when);
                 if (cui_list_item(ui, n->title[0] ? n->title : wada_tr("Untitled"),
                                   .selected = index == st->selected, .subtitle = when)) {
                     select_note(st, index);
@@ -325,7 +311,7 @@ static void sidebar(notes_state *st) {
 static void editor(notes_state *st) {
     cui_ctx *ui = wada_app_ui(st->app);
     const note *n = notes_at(&st->repo, st->selected);
-    bool confirming = n && st->confirm_delete == st->selected;
+    bool confirming = n && wada_ui_confirm_active(&st->confirm, st->selected);
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad_left = 28, .pad_right = 28,
                .pad_top = 20, .gap = 10) {
@@ -344,7 +330,7 @@ static void editor(notes_state *st) {
 
             char when[32];
             char chars[48];
-            format_when(n->updated, when, sizeof when);
+            wada_ui_format_when(n->updated, when, sizeof when);
             wada_trf(chars, sizeof chars, "%d chars", (int)strlen(st->body));
             cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 10) {
                 cui_text(ui, wada_tr(st->dirty ? "Unsaved" : "Saved"), .size = 11,
@@ -363,23 +349,11 @@ static void editor(notes_state *st) {
                     cmd_delete(st);
                 }
                 if (confirming && cui_button(ui, wada_tr("Keep"), .variant = CUI_BUTTON_GHOST)) {
-                    st->confirm_delete = -1;
-                    st->confirm_frames = 0;
+                    wada_ui_confirm_reset(&st->confirm);
                 }
             }
         }
     }
-}
-
-static void cancel_confirm(notes_state *st, cui_ctx *ui) {
-    if (st->confirm_delete < 0) return;
-    if (cui_key_pressed(ui, CUI_KEY_ESCAPE) || st->confirm_delete != st->selected ||
-        st->confirm_frames <= 0) {
-        st->confirm_delete = -1;
-        st->confirm_frames = 0;
-        return;
-    }
-    st->confirm_frames--;
 }
 
 static void notes_frame(void *state, wada_app *app) {
@@ -388,7 +362,7 @@ static void notes_frame(void *state, wada_app *app) {
     tick_growth(st);
     refresh_filter(st);
     tick_autosave(st);
-    cancel_confirm(st, wada_app_ui(app));
+    wada_ui_confirm_tick(&st->confirm, wada_app_ui(app), st->selected);
 
     cui_row(wada_app_ui(app), .width = CUI_FILL, .height = CUI_FILL) {
         sidebar(st);
@@ -454,7 +428,7 @@ static void *notes_enter(wada_app *app, wada_scope *scope, const char *data_dir,
     st->app = app;
     st->selected = -1;
     st->last_version = -1;
-    st->confirm_delete = -1;
+    wada_ui_confirm_init(&st->confirm);
 
     if (!grow_buffer(&st->body, &st->body_cap, BODY_MIN_CAP) ||
         !grow_buffer(&st->base_body, &st->base_cap, BODY_MIN_CAP)) {
@@ -463,15 +437,14 @@ static void *notes_enter(wada_app *app, wada_scope *scope, const char *data_dir,
         return NULL;
     }
 
-    const wada_store_ops *ops = wada_registry_get(wada_app_registry(app), "store", WADA_STORE_ABI, NULL);
+    const wada_store_ops *ops = wada_ui_store_ops(app, "notes", err);
     if (!ops) {
-        wada_err_set(err, WADA_ERR_NOT_FOUND, "notes: no store service");
         free_state(st);
         return NULL;
     }
 
     char path[640];
-    snprintf(path, sizeof path, "%s" WADA_PATH_SEP "wada.db", data_dir);
+    wada_ui_db_path(data_dir, path, sizeof path);
     if (notes_open(&st->repo, ops, path, err) != WADA_OK) {
         free_state(st);
         return NULL;
@@ -506,6 +479,8 @@ static void notes_leave(void *state) {
     free_state(st);
 }
 
+static const char *const notes_prefixes[] = {"note/", "note-body/"};
+
 const wada_product notes_product = {
     "notes",
     "Notes",
@@ -516,4 +491,6 @@ const wada_product notes_product = {
     (int)(sizeof notes_strings / sizeof notes_strings[0]),
     notes_walk,
     (int)(sizeof notes_walk / sizeof notes_walk[0]),
+    notes_prefixes,
+    (int)(sizeof notes_prefixes / sizeof notes_prefixes[0]),
 };

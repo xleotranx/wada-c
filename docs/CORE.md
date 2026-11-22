@@ -524,7 +524,8 @@ the pre-v1 copy to confirm it is the old schema with the old record.
 | **6** | settings panel, i18n tables, provider modules | the platform is user-configurable and extensible without core changes | done |
 | **7** | step hook + panel actions, declared doctor screens, status policy | automation presses real keys and walks every declared screen | done |
 | **8** | instance lock, unique ids, key discipline, pre-migration and daily backups | data survives a second instance, a restart and a migration | done |
-| **9** | records + ui kit (shared list/editor scaffold), one product shrunk and tested | duplication above the seam is removed without a framework | next |
+| **9** | records + ui kit (`wada_records`, `wada_ui`), products shrunk, `bookmarks` example | duplication above the seam is removed without a framework | done |
+| **10** | bus wildcards + scoped sub, `wada_records_search`, `product/entered`, `prefixes`, `setup` hook, `workbench` example | multi-product apps compose across shared services and cross-scope events cleanly | done |
 
 Each step has one acceptance rule: no change outside the new product's folder
 plus one registration line. If a step needs core changes, the boundary was
@@ -550,9 +551,13 @@ it sees a foreign change. Building the window first would prove the easy half
 and hide the real problem, so it waits for a design step of its own.
 
 A second reference is the `examples/` folder: `hello` (product lifecycle,
-commands, shortcuts, bus) and `todo` (the store service and a versioned record
-format). They are the teaching versions of the product contract and are built
-by default as separate executables.
+commands, shortcuts, bus), `todo` (the store service via `wada_records` and
+`wada_ui`), `bookmarks` (`wada_records`, `wada_ui`, bus-driven cache
+invalidation and `--doctor` screen walks) and `workbench` (two-product app with
+`proj/` + `issue/` + `act/` records, `wada_records_search`, `wada_boot_desc.setup`,
+app-lifetime `"wb.activity"` service, and multi-subscriber `"wb/*"` +
+`"product/entered"` bus events). They are built by default as separate
+executables.
 
 ---
 

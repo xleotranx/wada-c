@@ -34,6 +34,10 @@ typedef struct wada_product {
      * dialog. */
     const char *const *walk;
     int walk_count;
+    /* Optional: store key prefixes owned by this product (e.g. {"note/", "note-body/"}),
+     * reported by --doctor without hardcoding product names in boot. */
+    const char *const *prefixes;
+    int prefix_count;
 } wada_product;
 
 typedef struct wada_host wada_host;

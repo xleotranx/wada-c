@@ -239,6 +239,134 @@ without a reopen test — which is exactly why the step's tests are reopen tests
 
 ---
 
+## Build 7 — records & UI kit + bookmarks example
+
+**Exercised:** `wada_records` in `src/core/` (prefix-scoped CRUD, suffix-only id
+iteration, reopen-safe `fresh_id`, line sanitization/parsing), `wada_ui` in
+`src/shell/` (DB path, store service lookup, timestamps, error status, two-click
+delete confirmation), shrinking `cards.c`, `learning_product.c`, `notes_product.c`
+and `examples/todo/todo_product.c`, plus a third example app
+(`examples/bookmarks`, prefix `bm/`) wired to `wada_bus` (`bm/changed`).
+
+**Proved:**
+
+- The shared kit removes **204 lines** across four files (`cards.c` 312 → 220,
+  `todo_product.c` 315 → 241, `notes_product.c` 519 → 492,
+  `learning_product.c` 362 → 351) while `wada_cards_tests` (34 checks) and
+  `wada_notes_tests` (85 checks) continue to pass unchanged.
+- `wada_records` adds **49 dedicated checks** (`tests/test_records.c`): ABI
+  refusal (`WADA_ERR_ABI`), prefix isolation (`item/` vs `other/`), suffix-id
+  delivery (`id`, never `item/<id>`), early-stop iteration, reopen-safe id
+  generation, and line-record edge cases — still pure C99 inside `wada_core`.
+- A new store-backed example (`examples/bookmarks`, 422 lines across `main.c` +
+  `bookmarks_product.c`) builds on `wada_records` + `wada_ui` without core or
+  shell changes, declares `walk` (`bm.new`, `bm.delete`), and `wada_bookmarks
+  --doctor` draws 4 screens with `untranslated: 0`.
+- `wada.exe --doctor --lang vi` still reports `untranslated: 0 (screens drawn: 6)`
+  after refactoring both shipped products onto `wada_ui`.
+
+**Did not prove:**
+
+- `examples/bookmarks` behaviour beyond `--doctor` (4 screens drawn, command
+  surface, store probe): there is no `test_bookmarks` suite or scripted-input
+  test driving `bm.new` / `submit_add` / `bm.delete` end to end.
+- Cross-product value from `wada_bus`: `bookmarks_product.c` subscribes to
+  `bm/changed` to invalidate its filter cache, which exercises scope-owned
+  subscription inside a product, but a single-product emit to yourself is still
+  replaceable by a direct `dirty_filter = true` assignment.
+- `notes.c` refactor: `notes.c` stays explicit because its split metadata/body
+  records, FTS5 search, legacy migration and `.wnotes` export/import are richer
+  than single-record CRUD.
+
+**The leak it found:** `src/shell/wada_boot.c` hardcodes
+`prefixes[] = {"note/", "note-body/", "card/", "settings/", "todo/"}` in
+`doctor()`. Because `wada_boot.c` was left untouched for `examples/bookmarks`,
+`wada_bookmarks.exe --doctor` prints `counts:` without `bm/`. `--doctor` cannot
+be product-agnostic while the prefix list lives in boot instead of on
+`wada_product` (or discovered from the store).
+
+**Measured this round:** checks 377 → 426 (+49 in `wada_records_tests`); kit
+size is 352 lines (`wada_records` 47 + 196, `wada_ui` 33 + 76) vs 204 lines
+removed immediately and ~150 lines avoided in every new product; `wada.exe`
+stripped stays 2.81 MB (2,951,680 B); `wada_bookmarks.exe` stripped is 2.79 MB
+(2,926,080 B).
+
+---
+
+## Build 8 — workbench (multi-product) + core/shell upgrades
+
+**Exercised:** `wada_bus` trailing-`*` prefix wildcards (`"wb/*"` and `"*"`)
+and `wada_bus_subscribe_scoped`, `wada_records_search` (FTS5 search through
+`wada_records` with `WADA_ERR_UNSUPPORTED` fallback), `wada_product.prefixes`,
+`product/entered` emitted by `wada_host`, `wada_boot_desc.setup` app-lifetime
+initialization, and a multi-product Issue & Activity Workbench
+(`examples/workbench`: 2 products, 3 store prefixes `proj/`/`issue/`/`act/`,
+custom versioned `"wb.activity"` service, and two independent subscribers on
+`wb/*`).
+
+**Proved:**
+
+- **Multi-subscriber bus + scope isolation:** In `tests/test_workbench.c`
+  (44 checks), `wb_setup` registers an app-lifetime `"wb/*"` +
+  `"product/entered"` observer alongside an independent product-scoped `"wb/*"`
+  subscriber. Both receive `"wb/*"` events while the product scope lives;
+  destroying the product scope drops only the product subscriber while the
+  app-lifetime `"wb.activity"` service keeps recording events and persisting
+  `act/` records across reopen.
+- **Wildcard matching & scoped subscriptions:** `tests/test_core.c` (66 checks)
+  verifies exact + trailing-`*` priority ordering and automatic cancellation on
+  `wada_scope_destroy`.
+- **Prefix-scoped FTS5 search:** `wada_records_search` passes 15 checks in
+  `tests/test_records.c` (64 total) and drives `wb_issue_search` (title/notes
+  matching, prefix matching, update/delete index freshness, project/status
+  filtering, and `WADA_ERR_UNSUPPORTED` scan fallback).
+- **Zero-hardcode `--doctor` prefix counts:** Removing the hardcoded prefix
+  array from `src/shell/wada_boot.c` in favor of `wada_product.prefixes` makes
+  `wada.exe --doctor --lang vi` report `counts: settings/=0 note/=0 note-body/=0 card/=0`
+  (6 screens, 0 untranslated), `wada_bookmarks.exe --doctor` report
+  `counts: settings/=0 bm/=0` (4 screens), and `wada_workbench.exe --doctor`
+  report `counts: settings/=0 proj/=0 issue/=0 act/=0` across both products and
+  the settings panel (`untranslated: 0 (screens drawn: 7)`).
+- **`product/entered` lifecycle event:** `tests/test_host.c` (53 checks)
+  subscribes via `wada_bus_subscribe_scoped` and verifies payloads `"a"` and `"b"`
+  on real product switches.
+
+**Did not prove:**
+
+- Cross-product interactive flows in `wada_workbench.exe` via scripted UI key
+  injection (`wada_app_run_steps` is still tested in `test_host.c`, not in a
+  workbench UI harness).
+- Automated multi-process instance locking test (two-process exit-2 check
+  remains manual; `test_instance.c` still runs in one process).
+- `wada_records` FTS5 search over multi-record joins without keeping the index
+  filtered in memory (`wb_issue_search` calls `wada_records_search`, then joins
+  project/status filters against the in-memory `issues[]` array).
+
+**What it revealed:**
+
+- Adding a real app-lifetime observer (`wb_setup`) exposed a lifecycle seam boot
+  did not have: before Build 8, `wada_boot_run` created `app` and registered
+  `"store"`, then jumped straight to `wada_host_create`, giving an app no place
+  to install shared services or cross-product bus listeners owned by
+  `app_scope` (and no way for `--doctor` to exercise that setup). Adding
+  `wada_boot_desc.setup` solved both in 4 lines of `wada_boot.h`.
+- `wada_bus` finally earned its keep when two independent scopes (`app_scope`
+  auditor and `product_scope` filter cache) listened to `"wb/*"` with different
+  lifetimes; wildcard matching and `wada_bus_subscribe_scoped` turned a
+  two-step manual ownership pattern into one call.
+- A tiny C hygiene lesson during `-Wall -Wextra`: putting `"wb/*"` inside a
+  `/* ... */` block comment triggers `-Wcomment` across every translation unit
+  including `wada_event.h`.
+
+**Measured this round:** checks 426 → 493 (+67: `test_workbench` 44, `test_records`
++15, `test_core` +5, `test_host` +3); zero warnings across 76 build targets;
+`examples/workbench/` is 1,306 lines across 5 files (`wb_store.h` 122, `wb_store.c`
+494, `wb_issues_product.c` 477, `wb_activity_product.c` 230, `main.c` 23) +
+199-line test (`tests/test_workbench.c`); `wada.exe` stripped is 2.82 MB
+(2,953,216 B); `wada_workbench.exe` stripped is 2.81 MB (2,944,512 B).
+
+---
+
 ## Cross-build scorecard
 
 | Claim | Evidence | Verdict |
@@ -246,7 +374,8 @@ without a reopen test — which is exactly why the step's tests are reopen tests
 | Core is product-agnostic | 2 products, 0 domain branches in the core after 5 builds | **proven** |
 | Providers are replaceable | the same vtable works linked and loaded from a module; wrong ABI refused | **proven** |
 | Scopes make teardown mechanical | product switch disposes commands/subscriptions; panel survives a switch | **proven by construction** |
-| The bus defines reentrancy | tests only; no product subscribers | **speculative** |
+| The bus defines reentrancy | core tests (wildcards + snapshot) + two independent subscribers (`app_scope` auditor + `product_scope` cache) in `workbench` | **proven** |
+| Shared kit removes product duplication | `wada_records` (incl. `wada_records_search`) + `wada_ui` cut 204 lines across 4 files and power `bookmarks` + `workbench`; 64 records checks | **proven** |
 | Store interface is sufficient | CRUD, search, schema and migration used by two products | **proven for these products** |
 | Data model scales | metadata/body split, virtual list, cached filter | **proven at 10k-record math**, not measured at 10k |
 | Errors are visible to users | status bar + `<data-dir>\log.txt`; provider failures logged | **proven** |
@@ -410,11 +539,32 @@ without a reopen test — which is exactly why the step's tests are reopen tests
     writing snapshots.
   - Reopen tests reproduce the two data-loss bugs above; the store test opens
     the backup the provider reports.
+- **Shared records + UI kit (`wada_records`, `wada_ui`) and `examples/bookmarks`**:
+  - `wada_records` (in `wada_core`) handles ABI-checked open, `<prefix><id>` key
+    construction, reopen-safe `fresh_id`, put/get/del, suffix-stripping `each`,
+    and line helpers; 49 new checks in `tests/test_records.c`.
+  - `wada_ui` (in `wada_shell`) centralizes `wada.db` path construction, store
+    service lookup, timestamps, error-to-status reporting, and two-click
+    confirmation.
+  - `cards.c`, `learning_product.c`, `notes_product.c` and
+    `examples/todo/todo_product.c` shrink by 204 lines total; `examples/bookmarks`
+    proves the kit on a third store-backed product (`wada_bookmarks.exe`).
+- **Core/shell upgrades + `examples/workbench` (Build 8)**:
+  - `wada_bus` supports trailing-`*` prefix wildcards and
+    `wada_bus_subscribe_scoped` (`tests/test_core.c`: 66 checks).
+  - `wada_records_search` brings prefix-scoped FTS5 search into `wada_core`
+    with `WADA_ERR_UNSUPPORTED` degradation (`tests/test_records.c`: 64 checks).
+  - `wada_host` emits `product/entered`, `wada_product.prefixes` replaces the
+    hardcoded prefix list in `wada_boot.c`, and `wada_boot_desc.setup` gives
+    apps an app-lifetime initialization hook before `wada_host_create`.
+  - `examples/workbench` (`wada_workbench.exe`, `tests/test_workbench.c` 44
+    checks) exercises 2 products (`wb.issues`, `wb.activity`), 3 prefixes
+    (`proj/`, `issue/`, `act/`), FTS5 search, an app-lifetime `"wb.activity"`
+    service, and two independent `"wb/*"` bus subscribers.
 
 Remaining after this pass: pre-migration and POSIX-lock tests, backup cost and
-rotation for large stores, the records/ui kit, a third language, synthetic
-clicks, and multi-window coherence. The P0/P1 lists above are otherwise
-complete.
+rotation for large stores, a third language, synthetic clicks, unsaved-exit
+guard, and multi-window coherence.
 
 ---
 
@@ -461,14 +611,20 @@ bad data layout.
 
 ### P0 — do next (evidence is strong, scope is clear)
 
-No open P0 items. The next work is the duplication list in P1.
+No open P0 items.
+
+### P1 — done in round 7 (kept for the record)
+
+11. **`wada_records` helper** — done (`src/core/wada_records.*`, 49 checks; `cards.c` 312 → 220, `todo_product.c` 315 → 241).
+12. **`wada_ui` kit** — done (`src/shell/wada_ui.*`; used by `notes_product.c`, `learning_product.c`, `todo_product.c`, `bookmarks_product.c`).
+
+### P1 — done in round 8 (kept for the record)
+
+19. **Product-declared prefix for `--doctor` `counts:`** — done (`wada_product.prefixes`, removing the hardcoded list from `src/shell/wada_boot.c`).
+20. **Multi-subscriber domain events on the bus** — done (`wada_bus` wildcards, `wada_bus_subscribe_scoped`, `product/entered`, and `wada_boot_desc.setup` exercised by two independent subscribers in `examples/workbench`).
 
 ### P1 — next cycle
 
-11. `wada_records` helper (load/put/delete/iterate by prefix) to kill the repo
-    duplication; then notes/cards shrink.
-12. `wada_ui` kit: list/detail scaffold, relative time, path building, error
-    banners; then two products shrink by ~150 lines each.
 13. Unsaved-exit guard (autosave covers 20 frames, not the first ones).
 14. Third language: change the pair shape to a language list
     (`{en, const char *texts[]}`) before any product ships strings from a module.
@@ -482,10 +638,8 @@ No open P0 items. The next work is the duplication list in P1.
 
 ### P2 — only with a consumer
 
-19. Domain change events on the bus (`record/changed`) — or delete the bus. It
-    still has no product subscriber after six builds.
-20. Plugin signing, sandboxing, a marketplace.
-21. Multi-window: needs a cross-process change channel first (see CORE §12).
+21. Plugin signing, sandboxing, a marketplace.
+22. Multi-window: needs a cross-process change channel first (see CORE §12).
 
 ---
 
@@ -499,8 +653,10 @@ No open P0 items. The next work is the duplication list in P1.
    shape becomes part of that module's ABI — decide it then, not now.
 3. **The untranslated counter is a lower bound.** It counts what the doctor walk
    draws. Either walk every screen or label the number as partial.
-4. **The bus has one more build to prove itself.** If the next feature does not
-   need it, delete it: unused infrastructure is a lie about capability.
+4. **The bus earned its seat across scopes.** `workbench` runs two independent
+   subscribers with different lifetimes (`app_scope` audit service and
+   `product_scope` cache invalidation) over `"wb/*"` and `"product/entered"`,
+   proving the bus + wildcard + scope ownership seam for multi-product apps.
 5. **Provider modules stay load-once, validated, and out of the shipped default.**
    The executable keeps the linked provider; the module proves the seam and
    serves as the deployment option.

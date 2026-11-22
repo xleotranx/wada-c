@@ -1,8 +1,8 @@
 /* Todo product — an example with persistence.
  *
- * It shows how a product uses the "store" service without knowing the vendor:
- * the vtable comes from the registry, keys live under a private prefix, and
- * each record is a tiny versioned text format. There is no SQL here.
+ * It shows how a product uses the "store" service through wada_records and
+ * wada_ui: keys live under a private prefix ("todo/"), and each record is a
+ * tiny versioned text format. There is no SQL here.
  *
  * Run: build\wada_todo.exe
  */
@@ -10,12 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "wada_app.h"
-#include "wada_iface.h"
 #include "wada_log.h"
 #include "wada_product.h"
+#include "wada_records.h"
+#include "wada_ui.h"
 
 #define TODO_TEXT_CAP 256
 
@@ -27,50 +27,13 @@ typedef struct todo {
 
 typedef struct todo_state {
     wada_app *app;
-    const wada_store_ops *ops;
-    wada_store *store;
+    wada_records rec;
     todo *items;
     int count;
     int cap;
     char draft[TODO_TEXT_CAP];
     char status[96];
 } todo_state;
-
-static void sanitize(const char *in, char *out, size_t cap) {
-    size_t i = 0;
-    if (!in) in = "";
-    for (; in[i] && i + 1 < cap; i++) {
-        char ch = in[i];
-        if (ch == '\n' || ch == '\r') ch = ' ';
-        out[i] = ch;
-    }
-    out[i] = '\0';
-}
-
-static void todo_key(const char *id, char *out, size_t cap) {
-    snprintf(out, cap, "todo/%s", id);
-}
-
-/* The id is the suffix; every write and delete builds the key with the prefix,
- * so a record loaded from disk is written back under the key it came from. */
-static bool id_taken(todo_state *st, const char *id) {
-    char key[96];
-    todo_key(id, key, sizeof key);
-    wada_txn *txn = NULL;
-    if (st->ops->begin(st->store, WADA_STORE_READ, &txn, NULL) != WADA_OK) return false;
-    wada_slice k = {(const uint8_t *)key, strlen(key)};
-    wada_slice value;
-    bool taken = st->ops->get(txn, k, &value, NULL) == WADA_OK;
-    st->ops->rollback(txn);
-    return taken;
-}
-
-static void fresh_id(todo_state *st, char *out, size_t cap) {
-    for (int attempt = 0; attempt < 8; attempt++) {
-        wada_id_make(out, cap);
-        if (!id_taken(st, out)) return;
-    }
-}
 
 static bool append_item(todo_state *st, const todo *item) {
     if (st->count == st->cap) {
@@ -84,82 +47,52 @@ static bool append_item(todo_state *st, const todo *item) {
     return true;
 }
 
-static wada_status load_all(todo_state *st, wada_err *err) {
-    wada_txn *txn = NULL;
-    wada_status status = st->ops->begin(st->store, WADA_STORE_READ, &txn, err);
-    if (status != WADA_OK) return status;
+typedef struct todo_load_ctx {
+    todo_state *st;
+    bool oom;
+} todo_load_ctx;
 
-    wada_iter *it = NULL;
-    wada_slice prefix = {(const uint8_t *)"todo/", 5};
-    status = st->ops->list(txn, prefix, &it, err);
-    if (status != WADA_OK) {
-        st->ops->rollback(txn);
-        return status;
+static bool load_visitor(const char *id, wada_slice value, void *user) {
+    todo_load_ctx *ctx = (todo_load_ctx *)user;
+    todo item;
+    memset(&item, 0, sizeof item);
+    snprintf(item.id, sizeof item.id, "%s", id);
+
+    const char *p = (const char *)value.p;
+    const char *end = p + value.n;
+    char line[16];
+    if (wada_records_next_line(&p, end, line, sizeof line) &&
+        wada_records_next_line(&p, end, line, sizeof line)) {
+        item.done = line[0] == '1';
+        size_t len = (size_t)(end - p);
+        if (len >= sizeof item.text) len = sizeof item.text - 1;
+        memcpy(item.text, p, len);
+        item.text[len] = '\0';
     }
-
-    wada_slice key, value;
-    while (st->ops->next(it, &key, &value, NULL) == WADA_OK) {
-        /* Keys are "todo/<id>"; the record keeps the id, not the key. */
-        if (key.n <= 5) continue;
-        todo item;
-        memset(&item, 0, sizeof item);
-        size_t id_len = key.n - 5;
-        if (id_len > sizeof item.id - 1) id_len = sizeof item.id - 1;
-        memcpy(item.id, key.p + 5, id_len);
-
-        const char *p = (const char *)value.p;
-        const char *end = p + value.n;
-        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
-        if (nl) {
-            p = nl + 1;
-            if (p < end && (*p == '0' || *p == '1')) item.done = *p == '1';
-            nl = (const char *)memchr(p, '\n', (size_t)(end - p));
-            if (nl) {
-                p = nl + 1;
-                size_t len = (size_t)(end - p);
-                if (len >= sizeof item.text) len = sizeof item.text - 1;
-                memcpy(item.text, p, len);
-                item.text[len] = '\0';
-            }
-        }
-        if (!append_item(st, &item)) {
-            st->ops->iter_close(it);
-            st->ops->rollback(txn);
-            return wada_err_set(err, WADA_ERR_NOMEM, "todo load");
-        }
+    if (!append_item(ctx->st, &item)) {
+        ctx->oom = true;
+        return false;
     }
-    st->ops->iter_close(it);
-    return st->ops->commit(txn, err);
+    return true;
 }
 
 static wada_status write_item(todo_state *st, const todo *item, wada_err *err) {
     char buf[TODO_TEXT_CAP + 64];
+    size_t text_len = strlen(item->text);
     int head = snprintf(buf, sizeof buf, "v1\n%c\n", item->done ? '1' : '0');
-    size_t len = (size_t)head + strlen(item->text);
-    memcpy(buf + head, item->text, strlen(item->text));
-
-    wada_txn *txn = NULL;
-    wada_status status = st->ops->begin(st->store, WADA_STORE_WRITE, &txn, err);
-    if (status != WADA_OK) return status;
-    char keybuf[96];
-    todo_key(item->id, keybuf, sizeof keybuf);
-    wada_slice key = {(const uint8_t *)keybuf, strlen(keybuf)};
-    wada_slice value = {(const uint8_t *)buf, len};
-    status = st->ops->put(txn, key, value, err);
-    if (status == WADA_OK) {
-        status = st->ops->commit(txn, err);
-    } else {
-        st->ops->rollback(txn);
+    if (head < 0 || (size_t)head + text_len >= sizeof buf) {
+        return wada_err_set(err, WADA_ERR, "encode todo");
     }
-    return status;
+    memcpy(buf + head, item->text, text_len);
+    return wada_records_put(&st->rec, item->id, buf, (size_t)head + text_len, err);
 }
 
 static bool add_text(todo_state *st, const char *text, wada_err *err) {
     if (!text || !text[0]) return false;
     todo item;
     memset(&item, 0, sizeof item);
-    fresh_id(st, item.id, sizeof item.id);
-    sanitize(text, item.text, sizeof item.text);
+    wada_records_fresh_id(&st->rec, item.id, sizeof item.id);
+    wada_records_sanitize_line(text, item.text, sizeof item.text);
 
     if (write_item(st, &item, err) != WADA_OK) return false;
     if (!append_item(st, &item)) {
@@ -171,47 +104,39 @@ static bool add_text(todo_state *st, const char *text, wada_err *err) {
 
 static void clear_done(todo_state *st) {
     wada_err err;
-    wada_txn *txn = NULL;
-    if (st->ops->begin(st->store, WADA_STORE_WRITE, &txn, &err) != WADA_OK) return;
-    for (int i = 0; i < st->count; i++) {
-        if (!st->items[i].done) continue;
-        char keybuf[96];
-        todo_key(st->items[i].id, keybuf, sizeof keybuf);
-        wada_slice key = {(const uint8_t *)keybuf, strlen(keybuf)};
-        if (st->ops->del(txn, key, &err) != WADA_OK) {
-            st->ops->rollback(txn);
-            snprintf(st->status, sizeof st->status, "%s", wada_err_msg(&err));
-            return;
-        }
-    }
-    if (st->ops->commit(txn, &err) != WADA_OK) {
-        snprintf(st->status, sizeof st->status, "%s", wada_err_msg(&err));
-        return;
-    }
-
     int write = 0;
     for (int i = 0; i < st->count; i++) {
-        if (!st->items[i].done) st->items[write++] = st->items[i];
+        if (st->items[i].done) {
+            if (wada_records_del(&st->rec, st->items[i].id, &err) != WADA_OK) {
+                /* Keep items not yet deleted. */
+                for (int j = i; j < st->count; j++) st->items[write++] = st->items[j];
+                st->count = write;
+                wada_ui_status_err(st->app, st->status, sizeof st->status, &err);
+                return;
+            }
+        } else {
+            st->items[write++] = st->items[i];
+        }
     }
     st->count = write;
     snprintf(st->status, sizeof st->status, "cleared done items");
+    wada_app_set_status(st->app, st->status);
 }
 
 static void cmd_add(void *user) {
     todo_state *st = (todo_state *)user;
     wada_err err;
+    wada_err_clear(&err);
     if (add_text(st, st->draft, &err)) {
         st->draft[0] = '\0';
         wada_app_set_status(st->app, "added");
-    } else {
-        wada_app_set_status(st->app, wada_err_msg(&err));
+    } else if (err.code != WADA_OK) {
+        wada_ui_status_err(st->app, st->status, sizeof st->status, &err);
     }
 }
 
 static void cmd_clear(void *user) {
-    todo_state *st = (todo_state *)user;
-    clear_done(st);
-    wada_app_set_status(st->app, st->status);
+    clear_done((todo_state *)user);
 }
 
 static void *todo_enter(wada_app *app, wada_scope *scope, const char *data_dir, wada_err *err) {
@@ -221,21 +146,23 @@ static void *todo_enter(wada_app *app, wada_scope *scope, const char *data_dir, 
         return NULL;
     }
     st->app = app;
-    st->ops = (const wada_store_ops *)wada_registry_get(wada_app_registry(app), "store",
-                                                       WADA_STORE_ABI, NULL);
-    if (!st->ops) {
-        wada_err_set(err, WADA_ERR_NOT_FOUND, "todo: no store service");
+    const wada_store_ops *ops = wada_ui_store_ops(app, "todo", err);
+    if (!ops) {
         free(st);
         return NULL;
     }
     char path[640];
-    snprintf(path, sizeof path, "%s" WADA_PATH_SEP "wada.db", data_dir);
-    if (st->ops->open(path, &st->store, err) != WADA_OK) {
+    wada_ui_db_path(data_dir, path, sizeof path);
+    if (wada_records_open(&st->rec, ops, path, "todo/", err) != WADA_OK) {
         free(st);
         return NULL;
     }
-    if (load_all(st, err) != WADA_OK) {
-        st->ops->close(st->store);
+    todo_load_ctx ctx = {st, false};
+    wada_status status = wada_records_each(&st->rec, load_visitor, &ctx, err);
+    if (ctx.oom) status = wada_err_set(err, WADA_ERR_NOMEM, "todo load");
+    if (status != WADA_OK) {
+        wada_records_close(&st->rec);
+        free(st->items);
         free(st);
         return NULL;
     }
@@ -252,7 +179,7 @@ static void *todo_enter(wada_app *app, wada_scope *scope, const char *data_dir, 
 static void todo_leave(void *state) {
     todo_state *st = (todo_state *)state;
     if (!st) return;
-    st->ops->close(st->store);
+    wada_records_close(&st->rec);
     free(st->items);
     free(st);
 }
@@ -290,8 +217,7 @@ static void todo_frame(void *state, wada_app *app) {
                         wada_err err;
                         if (write_item(st, &st->items[i], &err) != WADA_OK) {
                             st->items[i].done = before;
-                            snprintf(st->status, sizeof st->status, "%s", wada_err_msg(&err));
-                            wada_app_set_status(st->app, st->status);
+                            wada_ui_status_err(st->app, st->status, sizeof st->status, &err);
                         }
                     }
                 }
@@ -306,10 +232,18 @@ static void todo_frame(void *state, wada_app *app) {
     }
 }
 
+static const char *const todo_prefixes[] = {"todo/"};
+
 const wada_product todo_product = {
     "todo",
     "Todo",
     todo_enter,
     todo_leave,
     todo_frame,
+    NULL,
+    0,
+    NULL,
+    0,
+    todo_prefixes,
+    (int)(sizeof todo_prefixes / sizeof todo_prefixes[0]),
 };

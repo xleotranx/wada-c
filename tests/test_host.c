@@ -34,6 +34,19 @@ static int enters_b;
 static int leaves_b;
 static int frames_b;
 static int invoked;
+static int entered_events;
+static char entered_last[32];
+
+static void on_entered(void *user, const char *topic, const void *data, size_t len) {
+    (void)user;
+    (void)topic;
+    entered_events++;
+    if (data && len > 0) {
+        size_t n = len < sizeof entered_last ? len : sizeof entered_last - 1;
+        memcpy(entered_last, data, n);
+        entered_last[n] = '\0';
+    }
+}
 
 static void on_command(void *user) {
     (void)user;
@@ -132,6 +145,10 @@ int main(void) {
         return 1;
     }
 
+    wada_sub *sub_entered = wada_bus_subscribe_scoped(
+        wada_app_bus(app), wada_app_scope(app), "product/entered", 0, on_entered, NULL);
+    CHECK(sub_entered != NULL);
+
     /* Two host commands plus the app's own two (quit, theme) exist before any
      * product enters. */
     CHECK(wada_app_command_count(app) == 4);
@@ -141,6 +158,7 @@ int main(void) {
     CHECK(enters_a == 1);
     CHECK(leaves_a == 0);
     CHECK(frames_a >= 1);
+    CHECK(entered_events == 1 && strcmp(entered_last, "a") == 0);
     CHECK(strcmp(wada_host_current(host), "a") == 0);
     CHECK(wada_app_command_count(app) == 5); /* four + a.cmd */
     CHECK(wada_app_invoke(app, "a.cmd"));
@@ -155,6 +173,7 @@ int main(void) {
     CHECK(leaves_a == 1);
     CHECK(enters_b == 1);
     CHECK(frames_b >= 1);
+    CHECK(entered_events == 2 && strcmp(entered_last, "b") == 0);
     CHECK(strcmp(wada_host_current(host), "b") == 0);
     CHECK(wada_app_command_count(app) == 5);
     CHECK(!wada_app_invoke(app, "a.cmd"));

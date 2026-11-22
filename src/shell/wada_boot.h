@@ -22,6 +22,10 @@ typedef struct wada_boot_desc {
     /* Subdirectory under the app data root; NULL means "Wada". Examples pass
      * their own so they cannot read or write the shipped app's database. */
     const char *data_subdir;
+    /* Optional app-lifetime setup hook: runs once after the "store" service is
+     * registered and before the product host is created. Use it to register
+     * shared services or cross-product bus observers owned by app_scope. */
+    wada_status (*setup)(wada_app *app, wada_scope *app_scope, const char *data_dir, wada_err *err);
 } wada_boot_desc;
 
 /* argc/argv are scanned for --app <id>, --provider <path>, --lang <code>,

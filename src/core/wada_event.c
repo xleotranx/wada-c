@@ -130,6 +130,25 @@ wada_sub *wada_bus_subscribe(wada_bus *bus, const char *topic, int priority, wad
     return sub;
 }
 
+wada_sub *wada_bus_subscribe_scoped(wada_bus *bus, wada_scope *owner, const char *topic,
+                                     int priority, wada_event_fn fn, void *user) {
+    wada_sub *sub = wada_bus_subscribe(bus, topic, priority, fn, user);
+    if (!sub) return NULL;
+    if (owner && wada_scope_own(owner, wada_bus_cancel_owned, sub) == 0) {
+        wada_bus_cancel(sub);
+        return NULL;
+    }
+    return sub;
+}
+
+static bool topic_matches(const char *pattern, const char *topic) {
+    size_t plen = strlen(pattern);
+    if (plen > 0 && pattern[plen - 1] == '*') {
+        return strncmp(pattern, topic, plen - 1) == 0;
+    }
+    return strcmp(pattern, topic) == 0;
+}
+
 void wada_bus_cancel(wada_sub *sub) {
     if (!sub || sub->canceled) return;
     sub->canceled = true;
@@ -148,7 +167,7 @@ void wada_bus_publish(wada_bus *bus, const char *topic, const void *data, size_t
     snap->n = 0;
     for (int i = 0; i < bus->count; i++) {
         wada_sub *sub = bus->subs[i];
-        if (!sub->canceled && strcmp(sub->topic, topic) == 0) {
+        if (!sub->canceled && topic_matches(sub->topic, topic)) {
             if (!snap_push(snap, sub)) return;
         }
     }

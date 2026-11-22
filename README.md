@@ -6,12 +6,13 @@ by registering commands, subscribing to the bus and implementing provider
 interfaces. Nothing in the core knows what the product is.
 
 ```
-src/core/             wada.h  err  log  scope  event  registry  iface
+src/core/             wada.h  err  log  scope  event  registry  iface  records
 src/shell/            wada_app (window, frame loop, commands, palette, status,
                                  surfaces)
                       wada_host (product registry + switching)
                       wada_settings (key/value settings over the store)
                       wada_settings_ui (the settings panel)
+                      wada_ui (shared product kit: paths, store, time, confirm)
                       wada_i18n (string tables: English + Tiếng Việt)
                       wada_instance (one process per data directory)
                       wada_module (provider modules: LoadLibrary/dlopen once)
@@ -19,12 +20,15 @@ src/shell/            wada_app (window, frame loop, commands, palette, status,
 src/core/             ... plus wada_id (unique, sortable record ids)
 src/providers/sqlite/ wada_store_ops over SQLite 3.54.1 (the only sqlite3.h),
                       linked into the app and built again as a loadable module
-src/apps/notes/       notes: list, search, editor, autosave, export/import
-src/apps/learning/    learning: cards, due queue, review session
+examples/notes/       notes: list, search, editor, autosave, export/import
+examples/learning/    learning: cards, due queue, review session
 examples/hello/       smallest complete product (lifecycle, commands, bus)
-examples/todo/        store-backed product (records, toggle, clear)
-tests/                core, store, notes, cards, host, i18n, module, instance
-                      (377 checks)
+examples/todo/        store-backed product over wada_records + wada_ui
+examples/bookmarks/   records + ui kit + bus invalidation + declared walk
+examples/workbench/   multi-product workbench (issues + activity, FTS5 search,
+                      app-lifetime service, wildcard bus + product/entered)
+tests/                core, records, store, notes, cards, host, i18n, module,
+                      instance, workbench (493 checks)
 vendor/cui/           CUI 1.4.0 (MIT), vendored source, compiled in
 vendor/sqlite/        SQLite 3.54.1 amalgamation (public domain), compiled in
 ```
@@ -98,8 +102,12 @@ your notes, cards, language and theme move with it.
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\build\wada.exe               # the shipped app (Notes + Learn)
+.\build\wada_notes.exe         # standalone Notes example
+.\build\wada_learning.exe      # standalone Learn example
 .\build\wada_hello.exe         # smallest example product
 .\build\wada_todo.exe          # store-backed example product
+.\build\wada_bookmarks.exe     # records + ui kit + bus example product
+.\build\wada_workbench.exe     # multi-product workbench (issues + activity)
 .\build\wada.exe --doctor      # writes <data-dir>\doctor.txt
 ```
 
@@ -111,7 +119,7 @@ Flags and environment hooks:
 | `--settings` | open the settings panel on start |
 | `--lang en\|vi` | run in a language (also `WADA_LANG`) |
 | `--provider <dll>` | load the store from a module instead of the linked one (also `WADA_STORE_MODULE`) |
-| `WADA_DATA_DIR` | data folder (default `%LOCALAPPDATA%\Wada`; examples use `Wada Hello`, `Wada Todo`) |
+| `WADA_DATA_DIR` | data folder (default `%LOCALAPPDATA%\Wada`; examples use `Wada Notes`, `Wada Learning`, `Wada Hello`, `Wada Todo`, `Wada Bookmarks`, `Wada Workbench`) |
 | `WADA_STUDY=1` | learning opens in a review session, for captures |
 | `WADA_NO_DAILY_BACKUP=1` | skip the once-a-day snapshot (automation; the pre-migration snapshot is never skipped) |
 | `CUI_SCREENSHOT`, `CUI_SCREENSHOT_FRAMES` | CUI's PNG capture (used for `shots/`) |
@@ -169,5 +177,13 @@ or `WADA_W64DEVKIT` pointing at its `bin`.
   panel is open, Escape closes it, and the panel's theme/language/product
   actions apply at the next frame and persist. i18n and module tests cover
   lookup/fallback/disposal and the module handshake.
-- Next: the records/ui kit that removes duplication across products
-  (see `docs/CORE.md` §12).
+- Kit: `wada_records` (prefix-scoped CRUD, suffix-id iteration, FTS5
+  `wada_records_search`, reopen-safe `fresh_id`, line helpers) and `wada_ui`
+  (DB path, store service lookup, timestamps, error status, two-click
+  confirmation) shared across products and examples; 64 dedicated checks in
+  `tests/test_records.c` (493 total across 10 suites).
+- Core & shell upgrades: `wada_bus` prefix wildcards (`"wb/*"`, `"*"`) and
+  `wada_bus_subscribe_scoped`, `product/entered` host lifecycle event,
+  `wada_product.prefixes` for zero-hardcode `--doctor` counts, and
+  `wada_boot_desc.setup` for app-lifetime services (`examples/workbench`).
+- Next: unsaved-exit guard and remaining P1 items (see `docs/LEARNINGS.md`).

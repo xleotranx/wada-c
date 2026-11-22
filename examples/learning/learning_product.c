@@ -14,6 +14,7 @@
 #include "wada_app.h"
 #include "wada_log.h"
 #include "wada_product.h"
+#include "wada_ui.h"
 
 #define MAX_QUEUE 512
 
@@ -80,22 +81,12 @@ typedef struct learn_state {
     char status[96];
 } learn_state;
 
-static void format_when(long long when, char *out, size_t cap) {
-    time_t t = (time_t)when;
-    struct tm *tm = localtime(&t);
-    if (!tm) {
-        snprintf(out, cap, "");
-        return;
-    }
-    strftime(out, cap, "%Y-%m-%d %H:%M", tm);
-}
-
 static void format_due(long long due, char *out, size_t cap) {
     if (due <= (long long)time(NULL)) {
         snprintf(out, cap, "%s", wada_tr("due now"));
         return;
     }
-    format_when(due, out, cap);
+    wada_ui_format_when(due, out, cap);
 }
 
 static void start_study(learn_state *st) {
@@ -111,8 +102,7 @@ static void grade(learn_state *st, int value) {
     wada_err err;
     int index = st->queue[st->pos];
     if (cards_review(&st->repo, index, value, &err) != WADA_OK) {
-        snprintf(st->status, sizeof st->status, "%s", wada_err_msg(&err));
-        wada_app_set_status(st->app, st->status);
+        wada_ui_status_err(st->app, st->status, sizeof st->status, &err);
         return;
     }
     st->pos++;
@@ -237,7 +227,7 @@ static void study(learn_state *st) {
                          .color = CUI_COLOR_TEXT_MUTED);
             } else {
                 char next[32];
-                format_when(cards_next_due(&st->repo), next, sizeof next);
+                wada_ui_format_when(cards_next_due(&st->repo), next, sizeof next);
                 { char _l[96]; wada_trf(_l, sizeof _l, "Next card is due %s.", next); cui_text(ui, _l); }
             }
             if (cui_button(ui, wada_tr("Check again"), .variant = CUI_BUTTON_OUTLINE)) start_study(st);
@@ -311,15 +301,14 @@ static void *learn_enter(wada_app *app, wada_scope *scope, const char *data_dir,
     st->app = app;
     st->selected = -1;
 
-    const wada_store_ops *ops = wada_registry_get(wada_app_registry(app), "store", WADA_STORE_ABI, NULL);
+    const wada_store_ops *ops = wada_ui_store_ops(app, "learning", err);
     if (!ops) {
-        wada_err_set(err, WADA_ERR_NOT_FOUND, "learning: no store service");
         free(st);
         return NULL;
     }
 
     char path[640];
-    snprintf(path, sizeof path, "%s" WADA_PATH_SEP "wada.db", data_dir);
+    wada_ui_db_path(data_dir, path, sizeof path);
     if (cards_open(&st->repo, ops, path, err) != WADA_OK) {
         free(st);
         return NULL;
@@ -349,6 +338,8 @@ static void learn_leave(void *state) {
     free(st);
 }
 
+static const char *const learn_prefixes[] = {"card/"};
+
 const wada_product learning_product = {
     "learning",
     "Learn",
@@ -359,4 +350,6 @@ const wada_product learning_product = {
     (int)(sizeof learn_strings / sizeof learn_strings[0]),
     learn_walk,
     (int)(sizeof learn_walk / sizeof learn_walk[0]),
+    learn_prefixes,
+    (int)(sizeof learn_prefixes / sizeof learn_prefixes[0]),
 };
