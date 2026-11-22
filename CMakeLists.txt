@@ -4,6 +4,14 @@ project(wada C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(WADA_IS_TOPLEVEL ON)
+else()
+    set(WADA_IS_TOPLEVEL OFF)
+endif()
+option(WADA_BUILD_APPS "Build Wada apps and examples" ${WADA_IS_TOPLEVEL})
+option(WADA_BUILD_TESTS "Build Wada tests" ${WADA_IS_TOPLEVEL})
+
 # The core: no third-party header, no UI. It must compile alone.
 add_library(wada_core STATIC
     src/core/wada_err.c
@@ -66,6 +74,7 @@ else()
     target_link_libraries(wada_shell PUBLIC X11 dl m Threads::Threads)
 endif()
 
+if(WADA_BUILD_APPS OR WADA_BUILD_TESTS)
 # The same SQLite provider delivered as a loadable module. The executable can
 # start with --provider <this file> and never link the provider at all.
 add_library(wada_store_plugin MODULE
@@ -89,7 +98,9 @@ set_target_properties(wada_store_plugin PROPERTIES PREFIX "")
 add_library(wada_bad_plugin MODULE tests/bad_plugin.c)
 target_include_directories(wada_bad_plugin PRIVATE src/core)
 set_target_properties(wada_bad_plugin PROPERTIES PREFIX "")
+endif()
 
+if(WADA_BUILD_APPS)
 # The shipped app: a product table and one boot call.
 add_executable(wada
     src/main.c
@@ -165,7 +176,9 @@ target_link_libraries(wada_workbench PRIVATE wada_shell)
 if(WIN32)
     set_target_properties(wada_workbench PROPERTIES WIN32_EXECUTABLE ON)
 endif()
+endif() # WADA_BUILD_APPS
 
+if(WADA_BUILD_TESTS)
 # Tests.
 add_executable(wada_tests tests/test_core.c)
 target_include_directories(wada_tests PRIVATE src/core)
@@ -215,3 +228,4 @@ add_test(NAME i18n COMMAND wada_i18n_tests)
 add_test(NAME plugin COMMAND wada_plugin_tests $<TARGET_FILE:wada_store_plugin> $<TARGET_FILE:wada_bad_plugin>)
 add_test(NAME instance COMMAND wada_instance_tests)
 add_test(NAME workbench COMMAND wada_workbench_tests)
+endif() # WADA_BUILD_TESTS
