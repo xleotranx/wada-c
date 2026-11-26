@@ -69,7 +69,13 @@ wada_instance *wada_instance_acquire(const char *data_dir, wada_err *err) {
     lock->pid = current_pid();
 
 #ifdef _WIN32
-    lock->handle = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0 /* no sharing */, NULL,
+    WCHAR wpath[1024] = {0};
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) <= 0) {
+        free(lock);
+        wada_err_set(err, WADA_ERR_IO, "invalid lock file path");
+        return NULL;
+    }
+    lock->handle = CreateFileW(wpath, GENERIC_READ | GENERIC_WRITE, 0 /* no sharing */, NULL,
                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (lock->handle == INVALID_HANDLE_VALUE) {
         DWORD code = GetLastError();

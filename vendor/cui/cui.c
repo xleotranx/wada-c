@@ -69216,8 +69216,16 @@ static void *cui__sw_thread(void *p) { cui__sw_run(p); return NULL; }
 static void cui__sw_paint_rect(cui_sw_renderer *r, const cui_draw_data *dd, void *pixels, int width, int height, int stride, cui_sw_format fmt,
                                int x0, int y0, int x1, int y1) {
     cui_color cc = dd->clear_color;
-    uint8_t c4[4] = { cc.r, cc.g, cc.b, 255 };
-    if (fmt == CUI_SW_BGRA) { c4[0] = cc.b; c4[2] = cc.r; }
+    uint8_t cr = cc.r, cg = cc.g, cb = cc.b, ca = cc.a;
+    if (ca == 0) {
+        cr = cg = cb = 0;
+    } else if (ca < 255) {
+        cr = (uint8_t)(((unsigned)cr * ca + 127u) / 255u);
+        cg = (uint8_t)(((unsigned)cg * ca + 127u) / 255u);
+        cb = (uint8_t)(((unsigned)cb * ca + 127u) / 255u);
+    }
+    uint8_t c4[4] = { cr, cg, cb, ca };
+    if (fmt == CUI_SW_BGRA) { c4[0] = cb; c4[2] = cr; }
     for (int y = y0; y < y1; y++) {
         uint8_t *row = (uint8_t *)pixels + (size_t)y * (size_t)stride + (size_t)x0 * 4;
         for (int x = 0, n = x1 - x0; x < n; x++) memcpy(row + (size_t)x * 4, c4, 4);

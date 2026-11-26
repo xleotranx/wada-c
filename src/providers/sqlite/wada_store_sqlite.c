@@ -12,7 +12,16 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <direct.h>
+#include <wchar.h>
+static bool utf8_to_wide_path(const char *path, WCHAR *out, int cap) {
+    if (!path || !out || cap <= 0) return false;
+    return MultiByteToWideChar(CP_UTF8, 0, path, -1, out, cap) > 0;
+}
 #endif
 /* ABI 2: kv stays the source of truth; kv_fts mirrors text values for search;
  * kv_fts_map remembers the FTS rowid for each key so an update can replace the
@@ -25,11 +34,23 @@ struct wada_store {
     sqlite3 *db;
     uint32_t schema;
     char backup_path[800]; /* "" when this store has no backup */
+    sqlite3_stmt *stmt_begin_read;
+    sqlite3_stmt *stmt_begin_write;
+    sqlite3_stmt *stmt_commit;
+    sqlite3_stmt *stmt_rollback;
+    sqlite3_stmt *stmt_get;
+    sqlite3_stmt *stmt_put;
+    sqlite3_stmt *stmt_del;
+    sqlite3_stmt *stmt_fts_find;
+    sqlite3_stmt *stmt_fts_del_fts;
+    sqlite3_stmt *stmt_fts_del_map;
+    sqlite3_stmt *stmt_fts_ins_fts;
+    sqlite3_stmt *stmt_fts_ins_map;
 };
 
 struct wada_txn {
     struct wada_store *store;
-    sqlite3_stmt *last;
+    sqlite3_stmt *last; /* borrowed cached stmt; reset in txn_drop_last */
 };
 
 struct wada_iter {
@@ -73,36 +94,62 @@ static wada_status prepare(sqlite3 *db, const char *sql, sqlite3_stmt **out, wad
     return WADA_OK;
 }
 
+static wada_status cached_stmt(sqlite3 *db, sqlite3_stmt **slot, const char *sql, wada_err *err) {
+    if (!*slot) {
+        int rc = sqlite3_prepare_v2(db, sql, -1, slot, NULL);
+        if (rc != SQLITE_OK) return err_from_db(db, rc, err);
+    } else {
+        sqlite3_reset(*slot);
+    }
+    return WADA_OK;
+}
+
+static void finalize_cached_stmts(struct wada_store *s) {
+    sqlite3_stmt **slots[] = {
+        &s->stmt_begin_read, &s->stmt_begin_write, &s->stmt_commit, &s->stmt_rollback,
+        &s->stmt_get, &s->stmt_put, &s->stmt_del,
+        &s->stmt_fts_find, &s->stmt_fts_del_fts, &s->stmt_fts_del_map,
+        &s->stmt_fts_ins_fts, &s->stmt_fts_ins_map
+    };
+    for (size_t i = 0; i < sizeof slots / sizeof slots[0]; i++) {
+        if (*slots[i]) {
+            sqlite3_finalize(*slots[i]);
+            *slots[i] = NULL;
+        }
+    }
+}
+
 static void txn_drop_last(struct wada_txn *txn) {
     if (txn->last) {
-        sqlite3_finalize(txn->last);
+        sqlite3_reset(txn->last);
         txn->last = NULL;
     }
 }
 
 static wada_status index_remove(struct wada_store *s, wada_slice key, wada_err *err) {
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(s->db, "SELECT rid FROM kv_fts_map WHERE k = ?1", &stmt, err) != WADA_OK) return WADA_ERR;
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
+    if (cached_stmt(s->db, &s->stmt_fts_find, "SELECT rid FROM kv_fts_map WHERE k = ?1", err) != WADA_OK) {
+        return WADA_ERR;
+    }
+    sqlite3_bind_blob(s->stmt_fts_find, 1, key.p, (int)key.n, SQLITE_STATIC);
 
     bool found = false;
     int64_t rid = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        rid = sqlite3_column_int64(stmt, 0);
+    if (sqlite3_step(s->stmt_fts_find) == SQLITE_ROW) {
+        rid = sqlite3_column_int64(s->stmt_fts_find, 0);
         found = true;
     }
-    sqlite3_finalize(stmt);
+    sqlite3_reset(s->stmt_fts_find);
     if (!found) return WADA_OK;
 
-    if (prepare(s->db, "DELETE FROM kv_fts WHERE rowid = ?1", &stmt, err) == WADA_OK) {
-        sqlite3_bind_int64(stmt, 1, rid);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+    if (cached_stmt(s->db, &s->stmt_fts_del_fts, "DELETE FROM kv_fts WHERE rowid = ?1", err) == WADA_OK) {
+        sqlite3_bind_int64(s->stmt_fts_del_fts, 1, rid);
+        sqlite3_step(s->stmt_fts_del_fts);
+        sqlite3_reset(s->stmt_fts_del_fts);
     }
-    if (prepare(s->db, "DELETE FROM kv_fts_map WHERE k = ?1", &stmt, err) == WADA_OK) {
-        sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+    if (cached_stmt(s->db, &s->stmt_fts_del_map, "DELETE FROM kv_fts_map WHERE k = ?1", err) == WADA_OK) {
+        sqlite3_bind_blob(s->stmt_fts_del_map, 1, key.p, (int)key.n, SQLITE_STATIC);
+        sqlite3_step(s->stmt_fts_del_map);
+        sqlite3_reset(s->stmt_fts_del_map);
     }
     return WADA_OK;
 }
@@ -111,24 +158,23 @@ static wada_status index_put(struct wada_store *s, wada_slice key, wada_slice va
     if (memchr(value.p, 0, value.n) != NULL) return WADA_OK; /* binary: not indexed */
     if (index_remove(s, key, err) != WADA_OK) return WADA_ERR;
 
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(s->db, "INSERT INTO kv_fts (k, text) VALUES (?1, ?2)", &stmt, err) != WADA_OK) {
+    if (cached_stmt(s->db, &s->stmt_fts_ins_fts, "INSERT INTO kv_fts (k, text) VALUES (?1, ?2)", err) != WADA_OK) {
         return WADA_ERR;
     }
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, value.p, (int)value.n, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    sqlite3_bind_blob(s->stmt_fts_ins_fts, 1, key.p, (int)key.n, SQLITE_STATIC);
+    sqlite3_bind_blob(s->stmt_fts_ins_fts, 2, value.p, (int)value.n, SQLITE_STATIC);
+    int rc = sqlite3_step(s->stmt_fts_ins_fts);
+    sqlite3_reset(s->stmt_fts_ins_fts);
     if (rc != SQLITE_DONE) return err_from_db(s->db, rc, err);
 
     int64_t rid = sqlite3_last_insert_rowid(s->db);
-    if (prepare(s->db, "INSERT INTO kv_fts_map (k, rid) VALUES (?1, ?2)", &stmt, err) != WADA_OK) {
+    if (cached_stmt(s->db, &s->stmt_fts_ins_map, "INSERT INTO kv_fts_map (k, rid) VALUES (?1, ?2)", err) != WADA_OK) {
         return WADA_ERR;
     }
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, rid);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    sqlite3_bind_blob(s->stmt_fts_ins_map, 1, key.p, (int)key.n, SQLITE_STATIC);
+    sqlite3_bind_int64(s->stmt_fts_ins_map, 2, rid);
+    rc = sqlite3_step(s->stmt_fts_ins_map);
+    sqlite3_reset(s->stmt_fts_ins_map);
     return rc == SQLITE_DONE ? WADA_OK : err_from_db(s->db, rc, err);
 }
 
@@ -150,7 +196,9 @@ static wada_status index_put(struct wada_store *s, wada_slice key, wada_slice va
 
 static bool make_dir(const char *path) {
 #ifdef _WIN32
-    return _mkdir(path) == 0 || errno == EEXIST;
+    WCHAR wpath[1024] = {0};
+    if (!utf8_to_wide_path(path, wpath, 1024)) return false;
+    return _wmkdir(wpath) == 0 || errno == EEXIST;
 #else
     return mkdir(path, 0755) == 0 || errno == EEXIST;
 #endif
@@ -177,8 +225,10 @@ static bool is_memory_url(const char *url) {
 
 static bool backup_from_today(const char *path) {
 #ifdef _WIN32
+    WCHAR wpath[1024] = {0};
+    if (!utf8_to_wide_path(path, wpath, 1024)) return false;
     struct _stat64 st;
-    if (_stat64(path, &st) != 0) return false;
+    if (_wstat64(wpath, &st) != 0) return false;
     time_t mtime = (time_t)st.st_mtime;
 #else
     struct stat st;
@@ -194,7 +244,12 @@ static bool backup_from_today(const char *path) {
 
 static wada_status vacuum_into(struct wada_store *s, const char *path, wada_err *err) {
     /* VACUUM INTO refuses an existing file: the backup replaces the old copy. */
+#ifdef _WIN32
+    WCHAR wpath[1024] = {0};
+    if (utf8_to_wide_path(path, wpath, 1024)) _wremove(wpath);
+#else
     remove(path);
+#endif
     char *sql = sqlite3_mprintf("VACUUM INTO %Q", path);
     if (!sql) return wada_err_set(err, WADA_ERR_NOMEM, "backup: out of memory");
     wada_status st = exec_sql(s->db, sql, err);
@@ -416,17 +471,18 @@ static wada_status sql_open(const char *url, wada_store **out, wada_err *err) {
 
 static void sql_close(struct wada_store *s) {
     if (!s) return;
+    finalize_cached_stmts(s);
     sqlite3_close_v2(s->db);
     free(s);
 }
 
 static wada_status sql_begin(struct wada_store *s, wada_store_mode mode, struct wada_txn **out, wada_err *err) {
     if (!s || !out) return wada_err_set(err, WADA_ERR_INVALID, "begin");
+    sqlite3_stmt **slot = (mode == WADA_STORE_WRITE) ? &s->stmt_begin_write : &s->stmt_begin_read;
     const char *sql = (mode == WADA_STORE_WRITE) ? "BEGIN IMMEDIATE" : "BEGIN";
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(s->db, sql, &stmt, err) != WADA_OK) return WADA_ERR;
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    if (cached_stmt(s->db, slot, sql, err) != WADA_OK) return WADA_ERR;
+    int rc = sqlite3_step(*slot);
+    sqlite3_reset(*slot);
     if (rc != SQLITE_DONE) return err_from_db(s->db, rc, err);
 
     struct wada_txn *txn = (struct wada_txn *)calloc(1, sizeof *txn);
@@ -441,69 +497,86 @@ static wada_status sql_begin(struct wada_store *s, wada_store_mode mode, struct 
 
 static wada_status sql_commit(struct wada_txn *t, wada_err *err) {
     if (!t) return wada_err_set(err, WADA_ERR_INVALID, "commit");
+    struct wada_store *s = t->store;
     txn_drop_last(t);
-    wada_status st = exec_sql(t->store->db, "COMMIT", err);
+    wada_status st = WADA_OK;
+    if (cached_stmt(s->db, &s->stmt_commit, "COMMIT", err) != WADA_OK) {
+        st = WADA_ERR_IO;
+    } else {
+        int rc = sqlite3_step(s->stmt_commit);
+        sqlite3_reset(s->stmt_commit);
+        if (rc != SQLITE_DONE) st = err_from_db(s->db, rc, err);
+    }
+    if (st != WADA_OK && !sqlite3_get_autocommit(s->db)) {
+        exec_sql(s->db, "ROLLBACK", NULL);
+    }
     free(t);
     return st;
 }
 
 static void sql_rollback(struct wada_txn *t) {
     if (!t) return;
+    struct wada_store *s = t->store;
     txn_drop_last(t);
-    exec_sql(t->store->db, "ROLLBACK", NULL);
+    if (cached_stmt(s->db, &s->stmt_rollback, "ROLLBACK", NULL) == WADA_OK) {
+        sqlite3_step(s->stmt_rollback);
+        sqlite3_reset(s->stmt_rollback);
+    } else {
+        exec_sql(s->db, "ROLLBACK", NULL);
+    }
     free(t);
 }
 
 static wada_status sql_get(struct wada_txn *t, wada_slice key, wada_slice *value, wada_err *err) {
     if (!t || !value) return wada_err_set(err, WADA_ERR_INVALID, "get");
+    struct wada_store *s = t->store;
     txn_drop_last(t);
 
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(t->store->db, "SELECT v FROM kv WHERE k = ?1", &stmt, err) != WADA_OK) return WADA_ERR;
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
+    if (cached_stmt(s->db, &s->stmt_get, "SELECT v FROM kv WHERE k = ?1", err) != WADA_OK) return WADA_ERR;
+    sqlite3_bind_blob(s->stmt_get, 1, key.p, (int)key.n, SQLITE_STATIC);
 
-    int rc = sqlite3_step(stmt);
+    int rc = sqlite3_step(s->stmt_get);
     if (rc == SQLITE_ROW) {
-        value->p = (const uint8_t *)sqlite3_column_blob(stmt, 0);
-        value->n = (size_t)sqlite3_column_bytes(stmt, 0);
-        t->last = stmt;
+        value->p = (const uint8_t *)sqlite3_column_blob(s->stmt_get, 0);
+        value->n = (size_t)sqlite3_column_bytes(s->stmt_get, 0);
+        t->last = s->stmt_get;
         return WADA_OK;
     }
-    sqlite3_finalize(stmt);
+    sqlite3_reset(s->stmt_get);
     if (rc == SQLITE_DONE) return wada_err_set(err, WADA_ERR_NOT_FOUND, "key not found");
-    return err_from_db(t->store->db, rc, err);
+    return err_from_db(s->db, rc, err);
 }
 
 static wada_status sql_put(struct wada_txn *t, wada_slice key, wada_slice value, wada_err *err) {
     if (!t) return wada_err_set(err, WADA_ERR_INVALID, "put");
+    struct wada_store *s = t->store;
     txn_drop_last(t);
 
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(t->store->db,
-                "INSERT INTO kv (k, v) VALUES (?1, ?2) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                &stmt, err) != WADA_OK) {
+    if (cached_stmt(s->db, &s->stmt_put,
+                    "INSERT INTO kv (k, v) VALUES (?1, ?2) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    err) != WADA_OK) {
         return WADA_ERR;
     }
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmt, 2, value.p, (int)value.n, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) return err_from_db(t->store->db, rc, err);
-    return index_put(t->store, key, value, err);
+    sqlite3_bind_blob(s->stmt_put, 1, key.p, (int)key.n, SQLITE_STATIC);
+    sqlite3_bind_blob(s->stmt_put, 2, value.p, (int)value.n, SQLITE_STATIC);
+    int rc = sqlite3_step(s->stmt_put);
+    sqlite3_reset(s->stmt_put);
+    if (rc != SQLITE_DONE) return err_from_db(s->db, rc, err);
+    return index_put(s, key, value, err);
 }
 
 static wada_status sql_del(struct wada_txn *t, wada_slice key, wada_err *err) {
     if (!t) return wada_err_set(err, WADA_ERR_INVALID, "del");
+    struct wada_store *s = t->store;
     txn_drop_last(t);
-    if (index_remove(t->store, key, err) != WADA_OK) return WADA_ERR;
+    if (index_remove(s, key, err) != WADA_OK) return WADA_ERR;
 
-    sqlite3_stmt *stmt = NULL;
-    if (prepare(t->store->db, "DELETE FROM kv WHERE k = ?1", &stmt, err) != WADA_OK) return WADA_ERR;
-    sqlite3_bind_blob(stmt, 1, key.p, (int)key.n, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) return err_from_db(t->store->db, rc, err);
+    if (cached_stmt(s->db, &s->stmt_del, "DELETE FROM kv WHERE k = ?1", err) != WADA_OK) return WADA_ERR;
+    sqlite3_bind_blob(s->stmt_del, 1, key.p, (int)key.n, SQLITE_STATIC);
+    int rc = sqlite3_step(s->stmt_del);
+    sqlite3_reset(s->stmt_del);
+    if (rc != SQLITE_DONE) return err_from_db(s->db, rc, err);
     return WADA_OK;
 }
 

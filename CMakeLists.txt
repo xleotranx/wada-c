@@ -45,34 +45,42 @@ target_compile_definitions(wada_sqlite PRIVATE
 )
 target_link_libraries(wada_sqlite PUBLIC wada_core)
 
-# The shell: window, commands, palette, status, product host, settings, i18n,
-# provider modules and boot. CUI lives here so the app and every example
-# compile it once.
+# The runtime: everything an app needs when it brings its own window shell —
+# core, the SQLite provider, i18n, the single-instance lock and the vendored
+# CUI toolkit. A native-shell app (Wada Snap) links this instead of wada_shell,
+# so the CUI application loop is not compiled into it.
+add_library(wada_runtime STATIC
+    src/shell/wada_i18n.c
+    src/shell/wada_instance.c
+    vendor/cui/cui.c
+)
+target_include_directories(wada_runtime PUBLIC src/core src/shell vendor/cui)
+target_link_libraries(wada_runtime PUBLIC wada_core wada_sqlite)
+
+if(WIN32)
+    target_link_libraries(wada_runtime PUBLIC user32 gdi32 opengl32 shell32 imm32 dwmapi comdlg32 ole32)
+elseif(APPLE)
+    enable_language(OBJC)
+    set_source_files_properties(vendor/cui/cui.c PROPERTIES COMPILE_FLAGS "-x objective-c -fobjc-arc -D_DARWIN_C_SOURCE")
+    target_link_libraries(wada_runtime PUBLIC "-framework Cocoa" "-framework QuartzCore" "-framework OpenGL")
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(wada_runtime PUBLIC X11 dl m Threads::Threads)
+endif()
+
+# The shell: the CUI window, commands, palette, status, product host, settings,
+# provider modules and boot. It sits on top of the runtime.
 add_library(wada_shell STATIC
     src/shell/wada_app.c
     src/shell/wada_boot.c
     src/shell/wada_host.c
-    src/shell/wada_i18n.c
-    src/shell/wada_instance.c
     src/shell/wada_module.c
     src/shell/wada_settings.c
     src/shell/wada_settings_ui.c
     src/shell/wada_ui.c
-    vendor/cui/cui.c
 )
 target_include_directories(wada_shell PUBLIC src/core src/shell vendor/cui)
-target_link_libraries(wada_shell PUBLIC wada_core wada_sqlite)
-
-if(WIN32)
-    target_link_libraries(wada_shell PUBLIC user32 gdi32 opengl32 shell32 imm32 dwmapi comdlg32 ole32)
-elseif(APPLE)
-    enable_language(OBJC)
-    set_source_files_properties(vendor/cui/cui.c PROPERTIES COMPILE_FLAGS "-x objective-c -fobjc-arc")
-    target_link_libraries(wada_shell PUBLIC "-framework Cocoa" "-framework QuartzCore" "-framework OpenGL")
-else()
-    find_package(Threads REQUIRED)
-    target_link_libraries(wada_shell PUBLIC X11 dl m Threads::Threads)
-endif()
+target_link_libraries(wada_shell PUBLIC wada_runtime)
 
 if(WADA_BUILD_APPS OR WADA_BUILD_TESTS)
 # The same SQLite provider delivered as a loadable module. The executable can
